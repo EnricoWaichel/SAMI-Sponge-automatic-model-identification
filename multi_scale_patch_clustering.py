@@ -1,7 +1,11 @@
 """
-SAMI - Multi-Scale Patch Clustering (Memory Optimized)
-Extract convolutional windows at different scales, cluster them, and visualize
-OPTIMIZED: Processes images one-by-one to avoid memory errors
+SAMI - Multi-Scale Patch Clustering (Enhanced Version)
+Improvements based on feedback:
+- UMAP instead of t-SNE
+- Percentile normalization (5%-95%)
+- Border/background removal
+- RGB pattern preservation
+- Patch visualization
 """
 
 import torch
@@ -11,8 +15,8 @@ from pathlib import Path
 import argparse
 from PIL import Image
 from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+import umap
 import cv2
 from tqdm import tqdm
 import pandas as pd
@@ -23,9 +27,9 @@ from utils import preprocess_image
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Multi-Scale Patch Clustering (Optimized)')
+    parser = argparse.ArgumentParser(description='Multi-Scale Patch Clustering (Enhanced)')
     parser.add_argument('--data_path', type=str, required=True,
-                       help='Path to data directory (containing leptomitid/ and choialike/)')
+                       help='Path to data directory')
     parser.add_argument('--output_dir', type=str, default='./patch_clustering_results',
                        help='Output directory')
     parser.add_argument('--model_path', type=str, default=None,
@@ -36,100 +40,155 @@ def parse_args():
                        help='Stride for sliding window')
     parser.add_argument('--n_clusters', type=int, default=10,
                        help='Number of clusters')
-    parser.add_argument('--viz_method', type=str, default='tsne',
-                       choices=['tsne', 'pca', 'both'],
+    parser.add_argument('--viz_method', type=str, default='umap',
+                       choices=['umap', 'pca', 'both'],
                        help='Visualization method')
     parser.add_argument('--max_patches_per_image', type=int, default=50,
-                       help='Maximum patches to extract per image (to limit memory)')
+                       help='Maximum patches per image')
     parser.add_argument('--feature_batch_size', type=int, default=32,
                        help='Batch size for feature extraction')
+    parser.add_argument('--min_content_ratio', type=float, default=0.7,
+                       help='Minimum content ratio to accept patch (0.7 = 70%% non-background)')
+    parser.add_argument('--visualize_patches', action='store_true',
+                       help='Save visualization of extracted patches')
     return parser.parse_args()
 
 
-def extract_patches_from_image(image_path, window_sizes, stride, max_patches=50):
+def percentile_normalize_image(img, lower_percentile=5, upper_percentile=95):
     """
-    Extract patches from a SINGLE image (memory efficient)
+    Normalize image using percentile clipping for better contrast
+    Apply per-channel normalization to preserve RGB patterns
     
     Args:
-        image_path: Path to image
-        window_sizes: List of window sizes
-        stride: Stride for sliding window
-        max_patches: Maximum patches to extract (to limit memory)
+        img: RGB image array (H, W, 3)
+        lower_percentile: Lower percentile to clip (default 5%%)
+        upper_percentile: Upper percentile to clip (default 95%%)
     
     Returns:
-        List of (patch_array, metadata) tuples
+        Normalized image in range [0, 255]
     """
-    # Read image
+    img_normalized = np.zeros_like(img, dtype=np.float32)
+    
+    # Normalize each channel independently
+    for c in range(3):  # R, G, B
+        channel = img[:, :, c].astype(np.float32)
+        
+        # Calculate percentiles
+        p_low = np.percentile(channel, lower_percentile)
+        p_high = np.percentile(channel, upper_percentile)
+        
+        # Clip and normalize to 0-255
+        channel_clipped = np.clip(channel, p_low, p_high)
+        
+        if p_high > p_low:
+            channel_normalized = (channel_clipped - p_low) / (p_high - p_low) * 255.0
+        else:
+            channel_normalized = channel_clipped
+        
+        img_normalized[:, :, c] = channel_normalized
+    
+    return img_normalized.astype(np.uint8)
+
+
+def is_valid_patch(patch, min_content_ratio=0.7):
+    """
+    Check if patch contains enough content (not mostly background/border)
+    
+    Args:
+        patch: RGB patch array
+        min_content_ratio: Minimum ratio of non-background pixels
+    
+    Returns:
+        True if patch is valid, False if mostly background
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+    
+    # Simple threshold: background is usually white (>240) or very dark (<15)
+    background_mask = (gray > 240) | (gray < 15)
+    
+    # Calculate content ratio
+    content_ratio = 1.0 - (np.sum(background_mask) / background_mask.size)
+    
+    return content_ratio >= min_content_ratio
+
+
+def extract_patches_from_image(image_path, window_sizes, stride, max_patches=50, min_content_ratio=0.7):
+    """
+    Extract patches from image with:
+    - Percentile normalization (5%%-95%%)
+    - Background removal
+    - RGB preservation
+    """
+    # Read image in RGB (not BGR!)
     img = cv2.imread(str(image_path))
     if img is None:
         return []
     
+    # Convert BGR to RGB
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w = img_rgb.shape[:2]
+    
+    # Apply percentile normalization to each channel
+    img_normalized = percentile_normalize_image(img_rgb, lower_percentile=5, upper_percentile=95)
+    
+    h, w = img_normalized.shape[:2]
     
     patches = []
     
     for window_size in window_sizes:
-        # Calculate how many patches we'll get
+        valid_patches_this_size = 0
+        max_per_size = max_patches // len(window_sizes)
+        
+        # Sample positions
         n_patches_h = (h - window_size) // stride + 1
         n_patches_w = (w - window_size) // stride + 1
-        total_patches_this_size = n_patches_h * n_patches_w
         
-        # Sample patches uniformly if too many
-        if total_patches_this_size > max_patches // len(window_sizes):
-            # Sample uniformly
-            step_h = max(1, n_patches_h // int(np.sqrt(max_patches // len(window_sizes))))
-            step_w = max(1, n_patches_w // int(np.sqrt(max_patches // len(window_sizes))))
-        else:
-            step_h = 1
-            step_w = 1
+        # Create grid of positions
+        positions_y = list(range(0, h - window_size + 1, stride))
+        positions_x = list(range(0, w - window_size + 1, stride))
         
-        count = 0
-        for i, y in enumerate(range(0, h - window_size + 1, stride)):
-            if i % step_h != 0:
-                continue
-            for j, x in enumerate(range(0, w - window_size + 1, stride)):
-                if j % step_w != 0:
-                    continue
-                
-                patch = img_rgb[y:y+window_size, x:x+window_size].copy()
-                
-                metadata = {
-                    'image_path': str(image_path),
-                    'image_name': image_path.stem,
-                    'window_size': window_size,
-                    'x': x,
-                    'y': y,
-                    'coords': f'{x}_{y}'
-                }
-                
-                patches.append((patch, metadata))
-                count += 1
-                
-                if count >= max_patches // len(window_sizes):
-                    break
-            if count >= max_patches // len(window_sizes):
+        # Shuffle to get random sampling
+        np.random.seed(42)
+        positions = [(y, x) for y in positions_y for x in positions_x]
+        np.random.shuffle(positions)
+        
+        for y, x in positions:
+            if valid_patches_this_size >= max_per_size:
                 break
+            
+            patch = img_normalized[y:y+window_size, x:x+window_size].copy()
+            
+            # Check if patch has enough content (not mostly background)
+            if not is_valid_patch(patch, min_content_ratio):
+                continue
+            
+            metadata = {
+                'image_path': str(image_path),
+                'image_name': image_path.stem,
+                'window_size': window_size,
+                'x': x,
+                'y': y,
+                'coords': f'{x}_{y}'
+            }
+            
+            patches.append((patch, metadata))
+            valid_patches_this_size += 1
     
     # Clean up
-    del img, img_rgb
+    del img, img_rgb, img_normalized
     gc.collect()
     
     return patches
 
 
-def process_dataset_iteratively(data_path, window_sizes, stride, max_patches_per_image):
-    """
-    Process dataset ONE IMAGE AT A TIME (memory efficient)
-    """
+def process_dataset_iteratively(data_path, window_sizes, stride, max_patches_per_image, min_content_ratio):
+    """Process dataset and collect image paths"""
     data_path = Path(data_path)
     
-    # Get all class folders
     class_folders = [d for d in data_path.iterdir() if d.is_dir()]
     
     print(f"Found {len(class_folders)} classes: {[d.name for d in class_folders]}")
     
-    # Collect all image paths first
     all_image_paths = []
     class_names = []
     
@@ -149,30 +208,31 @@ def process_dataset_iteratively(data_path, window_sizes, stride, max_patches_per
     return all_image_paths, class_names
 
 
-def extract_all_patches(image_paths, class_names, window_sizes, stride, max_patches_per_image):
-    """
-    Extract patches from all images, processing one at a time
-    """
+def extract_all_patches(image_paths, class_names, window_sizes, stride, max_patches_per_image, min_content_ratio):
+    """Extract patches from all images with enhanced preprocessing"""
     all_patches = []
     
-    print(f"\nExtracting patches from {len(image_paths)} images...")
+    print(f"\nExtracting patches with:")
+    print(f"  - Percentile normalization (5%%-95%%)")
+    print(f"  - Background removal (min content: {min_content_ratio*100}%%)")
+    print(f"  - RGB pattern preservation")
+    print()
     
     for img_path, class_name in tqdm(zip(image_paths, class_names), total=len(image_paths)):
-        patches = extract_patches_from_image(img_path, window_sizes, stride, max_patches_per_image)
+        patches = extract_patches_from_image(
+            img_path, window_sizes, stride, max_patches_per_image, min_content_ratio
+        )
         
-        # Add class to metadata
         for patch, metadata in patches:
             metadata['class'] = class_name
             metadata['prefix'] = f"{class_name}/{metadata['image_name']}/window_{metadata['window_size']}"
             all_patches.append((patch, metadata))
         
-        # Force garbage collection every 10 images
         if len(all_patches) % 100 == 0:
             gc.collect()
     
     print(f"Total patches extracted: {len(all_patches)}")
     
-    # Print statistics
     for class_name in set(class_names):
         n_patches = sum(1 for _, m in all_patches if m['class'] == class_name)
         print(f"  {class_name}: {n_patches} patches")
@@ -181,40 +241,33 @@ def extract_all_patches(image_paths, class_names, window_sizes, stride, max_patc
 
 
 def extract_features_from_patches(patches, model, device, batch_size=32):
-    """
-    Extract features from patches using ViT model (batch processing)
-    """
+    """Extract features preserving RGB information"""
     print("\nExtracting features from patches...")
     
     model.eval()
     all_features = []
     
-    # Process in batches
     for i in tqdm(range(0, len(patches), batch_size)):
         batch_patches = patches[i:i+batch_size]
         
-        # Prepare batch
         batch_tensors = []
         for patch_img, _ in batch_patches:
-            # Resize to 224x224 for ViT
-            patch_pil = Image.fromarray(patch_img)
+            # Convert to PIL maintaining RGB
+            patch_pil = Image.fromarray(patch_img)  # Already in RGB!
             patch_tensor = preprocess_image(patch_pil, img_size=224)
             batch_tensors.append(patch_tensor)
         
         batch = torch.stack(batch_tensors).to(device)
         
-        # Extract features
         with torch.no_grad():
             features = model(batch)
         
         all_features.append(features.cpu().numpy())
         
-        # Clean up
         del batch, features
         if device == 'cuda':
             torch.cuda.empty_cache()
         
-        # Garbage collection every few batches
         if i % (batch_size * 10) == 0:
             gc.collect()
     
@@ -225,15 +278,11 @@ def extract_features_from_patches(patches, model, device, batch_size=32):
 
 
 def cluster_patches(features, n_clusters, metadata_list):
-    """
-    Cluster patches based on features
-    """
+    """Cluster patches"""
     print(f"\nClustering patches into {n_clusters} groups...")
     
-    # Normalize features
     features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
     
-    # K-Means clustering
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, max_iter=300)
     labels = kmeans.fit_predict(features_norm)
     
@@ -241,13 +290,11 @@ def cluster_patches(features, n_clusters, metadata_list):
     silhouette = silhouette_score(features_norm, labels)
     print(f"Silhouette Score: {silhouette:.4f}")
     
-    # Print cluster statistics
     print("\nCluster Statistics:")
     for cluster_id in range(n_clusters):
         mask = labels == cluster_id
         n_patches = mask.sum()
         
-        # Count by class
         classes = [metadata_list[i]['class'] for i in range(len(labels)) if mask[i]]
         class_counts = {}
         for c in classes:
@@ -258,13 +305,13 @@ def cluster_patches(features, n_clusters, metadata_list):
     return labels, kmeans, silhouette
 
 
-def visualize_tsne(features, labels, metadata_list, output_path, silhouette_score):
-    """Create t-SNE visualization"""
-    print("\nComputing t-SNE (this may take a few minutes)...")
+def visualize_umap(features, labels, metadata_list, output_path, silhouette_score):
+    """Create UMAP visualization (better than t-SNE!)"""
+    print("\nComputing UMAP projection...")
     
-    # Use fewer samples if too many
+    # Sample if too many points
     if len(features) > 5000:
-        print(f"  Sampling 5000 patches from {len(features)} for faster t-SNE...")
+        print(f"  Sampling 5000 patches from {len(features)} for visualization...")
         indices = np.random.choice(len(features), 5000, replace=False)
         features_sample = features[indices]
         labels_sample = labels[indices]
@@ -274,13 +321,20 @@ def visualize_tsne(features, labels, metadata_list, output_path, silhouette_scor
         labels_sample = labels
         metadata_sample = metadata_list
     
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features_sample) // 4))
-    coords_2d = tsne.fit_transform(features_sample)
+    # UMAP projection
+    reducer = umap.UMAP(
+        n_neighbors=15,
+        min_dist=0.1,
+        n_components=2,
+        metric='cosine',
+        random_state=42
+    )
+    coords_2d = reducer.fit_transform(features_sample)
     
     # Create figure
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
     
-    # Plot 1: Colored by cluster
+    # Plot 1: By cluster
     ax1 = axes[0]
     n_clusters = len(set(labels_sample))
     colors = plt.cm.rainbow(np.linspace(0, 1, n_clusters))
@@ -292,13 +346,13 @@ def visualize_tsne(features, labels, metadata_list, output_path, silhouette_scor
                        c=[colors[cluster_id]], label=f'Cluster {cluster_id}',
                        alpha=0.6, s=20, edgecolors='black', linewidth=0.3)
     
-    ax1.set_title(f't-SNE: Colored by Cluster\nSilhouette Score: {silhouette_score:.3f}', 
+    ax1.set_title(f'UMAP: Colored by Cluster\nSilhouette Score: {silhouette_score:.3f}', 
                   fontsize=14, fontweight='bold')
-    ax1.set_xlabel('t-SNE Component 1')
-    ax1.set_ylabel('t-SNE Component 2')
+    ax1.set_xlabel('UMAP Component 1')
+    ax1.set_ylabel('UMAP Component 2')
     ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=2)
     
-    # Plot 2: Colored by class
+    # Plot 2: By class
     ax2 = axes[1]
     classes = list(set([m['class'] for m in metadata_sample]))
     class_colors = plt.cm.Set1(np.linspace(0, 1, len(classes)))
@@ -310,16 +364,16 @@ def visualize_tsne(features, labels, metadata_list, output_path, silhouette_scor
                        c=[class_colors[i]], label=class_name,
                        alpha=0.6, s=20, edgecolors='black', linewidth=0.3)
     
-    ax2.set_title('t-SNE: Colored by Original Class', fontsize=14, fontweight='bold')
-    ax2.set_xlabel('t-SNE Component 1')
-    ax2.set_ylabel('t-SNE Component 2')
+    ax2.set_title('UMAP: Colored by Original Class', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('UMAP Component 1')
+    ax2.set_ylabel('UMAP Component 2')
     ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"t-SNE plot saved to {output_path}")
+    print(f"UMAP plot saved to {output_path}")
 
 
 def visualize_pca(features, labels, metadata_list, output_path):
@@ -331,10 +385,9 @@ def visualize_pca(features, labels, metadata_list, output_path):
     
     print(f"  Explained variance: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
     
-    # Create figure
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
     
-    # Plot 1: Colored by cluster
+    # By cluster
     ax1 = axes[0]
     n_clusters = len(set(labels))
     colors = plt.cm.rainbow(np.linspace(0, 1, n_clusters))
@@ -350,7 +403,7 @@ def visualize_pca(features, labels, metadata_list, output_path):
     ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
     ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=2)
     
-    # Plot 2: Colored by class
+    # By class
     ax2 = axes[1]
     classes = list(set([m['class'] for m in metadata_list]))
     class_colors = plt.cm.Set1(np.linspace(0, 1, len(classes)))
@@ -373,8 +426,51 @@ def visualize_pca(features, labels, metadata_list, output_path):
     print(f"PCA plot saved to {output_path}")
 
 
+def visualize_patch_examples(patches, labels, metadata_list, output_dir, n_examples=5):
+    """Visualize example patches from each cluster"""
+    print("\nCreating patch visualization...")
+    
+    n_clusters = len(set(labels))
+    
+    fig, axes = plt.subplots(n_clusters, n_examples, figsize=(n_examples*2, n_clusters*2))
+    
+    if n_clusters == 1:
+        axes = axes.reshape(1, -1)
+    
+    for cluster_id in range(n_clusters):
+        # Get patches from this cluster
+        cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
+        
+        # Sample random examples
+        if len(cluster_indices) > n_examples:
+            sampled_indices = np.random.choice(cluster_indices, n_examples, replace=False)
+        else:
+            sampled_indices = cluster_indices[:n_examples]
+        
+        for col_idx, patch_idx in enumerate(sampled_indices):
+            patch_img, metadata = patches[patch_idx]
+            
+            axes[cluster_id, col_idx].imshow(patch_img)
+            axes[cluster_id, col_idx].axis('off')
+            
+            if col_idx == 0:
+                axes[cluster_id, col_idx].set_ylabel(f'Cluster {cluster_id}', 
+                                                     fontsize=10, fontweight='bold')
+            
+            # Add class label
+            class_name = metadata['class']
+            axes[cluster_id, col_idx].set_title(class_name, fontsize=8)
+    
+    plt.suptitle('Example Patches per Cluster', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / 'patch_examples.png', dpi=200, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Patch examples saved to {output_dir / 'patch_examples.png'}")
+
+
 def save_cluster_summary(labels, metadata_list, output_path):
-    """Save detailed cluster summary"""
+    """Save cluster summary"""
     print("\nSaving cluster summary...")
     
     data = []
@@ -395,7 +491,6 @@ def save_cluster_summary(labels, metadata_list, output_path):
     
     print(f"Cluster summary saved to {output_path}")
     
-    # Print cross-tabulation
     print("\nCross-tabulation: Class vs Cluster")
     ct = pd.crosstab(df['class'], df['cluster'], margins=True)
     print(ct)
@@ -408,43 +503,39 @@ def save_cluster_summary(labels, metadata_list, output_path):
 def main():
     args = parse_args()
     
-    # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("="*80)
-    print("SAMI - Multi-Scale Patch Clustering (Memory Optimized)")
+    print("SAMI - Multi-Scale Patch Clustering (Enhanced with UMAP)")
     print("="*80)
     print(f"Data path: {args.data_path}")
     print(f"Window sizes: {args.window_sizes}")
     print(f"Stride: {args.stride}")
     print(f"Max patches per image: {args.max_patches_per_image}")
+    print(f"Min content ratio: {args.min_content_ratio}")
     print(f"Number of clusters: {args.n_clusters}")
+    print(f"Visualization: {args.viz_method}")
     print("="*80 + "\n")
     
-    # Step 1: Get all image paths
+    # Step 1: Get image paths
     image_paths, class_names = process_dataset_iteratively(
-        Path(args.data_path), 
-        args.window_sizes, 
-        args.stride,
-        args.max_patches_per_image
+        Path(args.data_path), args.window_sizes, args.stride, 
+        args.max_patches_per_image, args.min_content_ratio
     )
     
-    # Step 2: Extract patches (one image at a time)
+    # Step 2: Extract patches with enhanced preprocessing
     all_patches = extract_all_patches(
-        image_paths, 
-        class_names, 
-        args.window_sizes, 
-        args.stride,
-        args.max_patches_per_image
+        image_paths, class_names, args.window_sizes, 
+        args.stride, args.max_patches_per_image, args.min_content_ratio
     )
     
     if len(all_patches) == 0:
-        print("ERROR: No patches extracted! Check your images.")
+        print("ERROR: No patches extracted!")
         return
     
     # Step 3: Load model
-    print("\nLoading Vision Transformer model...")
+    print("\nLoading Vision Transformer...")
     model = vit_small(patch_size=16)
     
     if args.model_path:
@@ -452,48 +543,49 @@ def main():
         state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(state_dict)
     else:
-        print("Warning: Using random initialization (results will be poor)")
+        print("Warning: Using random initialization")
     
     model.eval()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
-    print(f"Model loaded on {device}")
+    print(f"Model on {device}")
     
     # Step 4: Extract features
     features = extract_features_from_patches(all_patches, model, device, args.feature_batch_size)
     
-    # Extract metadata
     metadata_list = [metadata for _, metadata in all_patches]
-    
-    # Clean up patches to free memory
-    del all_patches
-    gc.collect()
     
     # Step 5: Cluster
     labels, kmeans, silhouette = cluster_patches(features, args.n_clusters, metadata_list)
     
     # Step 6: Visualize
-    if args.viz_method in ['tsne', 'both']:
-        visualize_tsne(features, labels, metadata_list, 
-                      output_dir / 'tsne_visualization.png', silhouette)
+    if args.viz_method in ['umap', 'both']:
+        visualize_umap(features, labels, metadata_list, 
+                      output_dir / 'umap_visualization.png', silhouette)
     
     if args.viz_method in ['pca', 'both']:
         visualize_pca(features, labels, metadata_list,
                      output_dir / 'pca_visualization.png')
     
-    # Step 7: Save results
+    # Step 7: Visualize patches
+    if args.visualize_patches:
+        visualize_patch_examples(all_patches, labels, metadata_list, output_dir)
+    
+    # Step 8: Save results
     save_cluster_summary(labels, metadata_list, output_dir / 'cluster_summary.csv')
     
     print("\n" + "="*80)
     print("Analysis Complete!")
     print("="*80)
-    print(f"\nResults saved to: {output_dir}")
+    print(f"Results: {output_dir}")
     print(f"Silhouette Score: {silhouette:.4f}")
     print("\nGenerated files:")
-    if args.viz_method in ['tsne', 'both']:
-        print("  - tsne_visualization.png")
+    if args.viz_method in ['umap', 'both']:
+        print("  - umap_visualization.png")
     if args.viz_method in ['pca', 'both']:
         print("  - pca_visualization.png")
+    if args.visualize_patches:
+        print("  - patch_examples.png")
     print("  - cluster_summary.csv")
     print("="*80)
 
