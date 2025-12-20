@@ -31,3 +31,4 @@ imagefolder_cambrian_sponges/
 # OS  
 .DS_Store  
 Thumbs.db 
+patch_results_enhanced/ 
