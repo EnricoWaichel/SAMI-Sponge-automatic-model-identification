@@ -24,6 +24,10 @@ env/
 *.ckpt  
 results/  
 outputs/  
+Database/
+*.jpg  
+*.png
+*.tif
   
 # Dataset  
 imagefolder_cambrian_sponges/  
@@ -32,3 +36,6 @@ imagefolder_cambrian_sponges/
 .DS_Store  
 Thumbs.db 
 patch_results_enhanced/ 
+
+
+
